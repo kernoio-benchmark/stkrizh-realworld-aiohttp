@@ -1,0 +1,120 @@
+services:
+  postgres:
+    image: "postgres:16-alpine"
+    pull_policy: missing
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 128M
+    environment:
+      - "POSTGRES_USER=conduit_user"
+      - "POSTGRES_PASSWORD=conduit_password"
+      - "POSTGRES_DB=conduit_db"
+    ports:
+      - "5432"
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "pg_isready -U conduit_user -d conduit_db"
+      interval: "3s"
+      timeout: "5s"
+      retries: "10"
+    tmpfs:
+      - /var/lib/postgresql/data
+    labels:
+      - external-url=postgresql://localhost:{{PORT}}/conduit_db?user=conduit_user&password=conduit_password
+
+  migrations:
+    build:
+      context: ${BUILD_CONTEXT}
+      dockerfile_inline: |
+        FROM python:3.11-bookworm AS builder
+
+        ENV POETRY_HOME=/opt/poetry
+        RUN python -m venv $$POETRY_HOME && $$POETRY_HOME/bin/pip install poetry==1.8.2
+
+        COPY pyproject.toml pyproject.toml
+        COPY poetry.lock poetry.lock
+
+
+        FROM builder AS migrations
+
+        WORKDIR /opt/conduit_migrations
+
+        RUN $$POETRY_HOME/bin/poetry config virtualenvs.create false && \
+            $$POETRY_HOME/bin/poetry install --only migrations --no-root
+
+        COPY conduit conduit
+        COPY migrations migrations
+        ENV PYTHONPATH=/opt/conduit_migrations
+        WORKDIR /opt/conduit_migrations/migrations
+        RUN sed -i 's/script_location = migrations/script_location = ./' alembic.ini
+        ENTRYPOINT ["alembic"]
+        CMD ["upgrade", "head"]
+
+
+        FROM builder AS runtime
+
+        WORKDIR /opt/conduit
+
+        RUN $$POETRY_HOME/bin/poetry config virtualenvs.create false && \
+            $$POETRY_HOME/bin/poetry install --only main --no-root
+
+        COPY conduit conduit
+        CMD ["python", "-m", "conduit"]
+      target: migrations
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+
+  sut:
+    build:
+      context: ${BUILD_CONTEXT}
+      dockerfile_inline: |
+        FROM python:3.11-bookworm AS builder
+
+        ENV POETRY_HOME=/opt/poetry
+        RUN python -m venv $$POETRY_HOME && $$POETRY_HOME/bin/pip install poetry==1.8.2
+
+        COPY pyproject.toml pyproject.toml
+        COPY poetry.lock poetry.lock
+
+
+        FROM builder AS migrations
+
+        WORKDIR /opt/conduit_migrations
+
+        RUN $$POETRY_HOME/bin/poetry config virtualenvs.create false && \
+            $$POETRY_HOME/bin/poetry install --only migrations --no-root
+
+        COPY conduit conduit
+        COPY migrations migrations
+        ENTRYPOINT ["alembic"]
+        CMD ["upgrade", "head"]
+
+
+        FROM builder AS runtime
+
+        WORKDIR /opt/conduit
+
+        RUN $$POETRY_HOME/bin/poetry config virtualenvs.create false && \
+            $$POETRY_HOME/bin/poetry install --only main --no-root
+
+        COPY conduit conduit
+        CMD ["python", "-m", "conduit"]
+      target: runtime
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrations:
+        condition: service_completed_successfully
+    env_file:
+      - .env
+    ports:
+      - "8080"
+    labels:
+      - jwt-signing-config=HS256:this_is_a_secret_meeting_all_requirements_of_any_hs_algorithms
